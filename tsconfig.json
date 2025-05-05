@@ -1,0 +1,20 @@
+{
+  "compilerOptions": {
+    "target": "ESNext",
+    "module": "ESNext",
+    "outDir": "./out",
+    "rootDir": "./",
+    "moduleResolution": "Node",
+    "typeRoots": [
+      "./node_modules/@webgpu/types",
+      "./node_modules/@types",
+    ],
+    "allowJs": true,
+    "allowSyntheticDefaultImports": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+  },
+  "include": ["src"]
+}
