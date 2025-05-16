@@ -1,6 +1,8 @@
 "use strict";
 import tgpu from "typegpu";
-import { arrayOf, u32, vec2u } from "typegpu/data";
+import * as d from "typegpu/data";
+import computeShaderString from "./shaders/compute.wgsl";
+import renderShaderString from "./shaders/render.wgsl";
 
 type Position = [number, number];
 
@@ -93,20 +95,7 @@ class PerlinNoise {
 }
 
 const startup = async () => {
-  const root = await tgpu.init();
-  const device = root.device;
-
   const canvas = document.querySelector("canvas") as HTMLCanvasElement;
-  // const context = canvas.getContext("webgpu") as GPUCanvasContext;
-  const devicePixelRatio = window.devicePixelRatio;
-  canvas.width = canvas.clientWidth * devicePixelRatio;
-  canvas.height = canvas.clientHeight * devicePixelRatio;
-  const presentationFormat = navigator.gpu.getPreferredCanvasFormat();
-  // context.configure({
-  //   device,
-  //   format: presentationFormat,
-  // });
-
   let ctx = canvas.getContext("2d");
 
   const GRID_SIZE = 4;
@@ -129,4 +118,207 @@ const startup = async () => {
   }
 };
 
-window.onload = startup;
+const startupTGPU = async () => {
+  const root = await tgpu.init();
+  const device = root.device;
+
+  const canvas = document.querySelector("canvas") as HTMLCanvasElement;
+  const context = canvas.getContext("webgpu") as GPUCanvasContext;
+
+  const presentationFormat = navigator.gpu.getPreferredCanvasFormat();
+  context.configure({
+    device,
+    format: presentationFormat,
+    alphaMode: "premultiplied",
+  });
+
+  let workgroupSize = 16;
+  let genSizes = [8192, 8192];
+  const gradientsGridSizes = [64, 64];
+
+  const computeLayout = {
+    memory: {
+      storage: (arrayLength: number) => d.arrayOf(d.f32, arrayLength),
+      access: "mutable",
+    },
+    gradients: {
+      storage: (arrayLength: number) => d.arrayOf(d.vec2f, arrayLength),
+      access: "readonly",
+    },
+    size: {
+      storage: d.vec2u,
+      access: "readonly",
+    },
+    gradientsGridSize: {
+      storage: d.vec2u,
+      access: "readonly",
+    },
+    gridSize: {
+      storage: d.vec2u,
+      access: "readonly",
+    },
+  } as const;
+
+  const groupLayout = {
+    size: {
+      uniform: d.vec2u,
+    },
+  } as const;
+
+  const bindGroupLayoutCompute = tgpu.bindGroupLayout(computeLayout);
+  const bindGroupLayoutRender = tgpu.bindGroupLayout(groupLayout);
+
+  const computeShader = device.createShaderModule({
+    code: tgpu.resolve({
+      template: computeShaderString,
+      externals: {
+        ...bindGroupLayoutCompute.bound,
+      },
+    }),
+  });
+
+  const renderShader = device.createShaderModule({
+    code: tgpu.resolve({
+      template: renderShaderString,
+      externals: {
+        ...bindGroupLayoutRender.bound,
+      },
+    }),
+  });
+
+  const computePipeline = device.createComputePipeline({
+    layout: device.createPipelineLayout({
+      bindGroupLayouts: [root.unwrap(bindGroupLayoutCompute)],
+    }),
+    compute: {
+      module: computeShader,
+      constants: {
+        blockSize: workgroupSize,
+      },
+    },
+  });
+
+  const squareVertexLayout = tgpu.vertexLayout(
+    (n: number) => d.arrayOf(d.location(1, d.vec2u), n),
+    "vertex"
+  );
+
+  const memoryVertexLayout = tgpu.vertexLayout(
+    (n: number) => d.arrayOf(d.location(0, d.f32), n),
+    "instance"
+  );
+
+  const memoryLength = genSizes[0] * genSizes[1];
+  console.log(memoryLength);
+  const memory = Array.from({ length: memoryLength }).fill(0) as Array<number>;
+
+  const gradientsLength = gradientsGridSizes[0] * gradientsGridSizes[1];
+  const gradients = Array.from({ length: gradientsLength })
+    .fill(0)
+    .map(() => d.vec2f(Math.random(), Math.random()));
+
+  const memoryBuffer = root
+    .createBuffer(d.arrayOf(d.f32, memoryLength), memory)
+    .$usage("storage", "vertex");
+
+  const gradientsBuffer = root
+    .createBuffer(d.arrayOf(d.vec2f, gradientsLength), gradients)
+    .$usage("uniform", "storage");
+
+  const sizeBuffer = root
+    .createBuffer(d.vec2u, d.vec2u(genSizes[0], genSizes[1]))
+    .$usage("uniform", "storage");
+
+  const squareBuffer = root
+    .createBuffer(d.arrayOf(d.u32, 8), [0, 0, 1, 0, 0, 1, 1, 1])
+    .$usage("vertex");
+
+  const gradientsGridSizeBuffer = root
+    .createBuffer(
+      d.vec2u,
+      d.vec2u(gradientsGridSizes[0], gradientsGridSizes[1])
+    )
+    .$usage("uniform", "storage");
+
+  const gradientsCellSizeBuffer = root
+    .createBuffer(
+      d.vec2u,
+      d.vec2u(
+        Math.round(genSizes[0] / gradientsGridSizes[0]),
+        Math.round(genSizes[1] / gradientsGridSizes[1])
+      )
+    )
+    .$usage("uniform", "storage");
+
+  const bindGroup = root.createBindGroup(bindGroupLayoutCompute, {
+    size: sizeBuffer,
+    memory: memoryBuffer,
+    gradients: gradientsBuffer,
+    gradientsGridSize: gradientsGridSizeBuffer,
+    gridSize: gradientsCellSizeBuffer,
+  });
+
+  const uniformBindGroup = root.createBindGroup(bindGroupLayoutRender, {
+    size: sizeBuffer,
+  });
+
+  const view = context.getCurrentTexture().createView();
+  const renderPass: GPURenderPassDescriptor = {
+    colorAttachments: [
+      {
+        view,
+        loadOp: "clear",
+        storeOp: "store",
+      },
+    ],
+  };
+
+  const commandEncoder = device.createCommandEncoder();
+  const passEncoderCompute = commandEncoder.beginComputePass();
+
+  passEncoderCompute.setPipeline(computePipeline);
+  passEncoderCompute.setBindGroup(0, root.unwrap(bindGroup));
+
+  passEncoderCompute.dispatchWorkgroups(
+    genSizes[0] / workgroupSize,
+    genSizes[1] / workgroupSize
+  );
+  passEncoderCompute.end();
+
+  const renderPipeline = device.createRenderPipeline({
+    layout: device.createPipelineLayout({
+      bindGroupLayouts: [root.unwrap(bindGroupLayoutRender)],
+    }),
+    primitive: {
+      topology: "triangle-strip",
+    },
+    vertex: {
+      module: renderShader,
+      buffers: [
+        root.unwrap(memoryVertexLayout),
+        root.unwrap(squareVertexLayout),
+      ],
+    },
+    fragment: {
+      module: renderShader,
+      targets: [
+        {
+          format: presentationFormat,
+        },
+      ],
+    },
+  });
+
+  const passEncoderRender = commandEncoder.beginRenderPass(renderPass);
+  passEncoderRender.setPipeline(renderPipeline);
+
+  passEncoderRender.setVertexBuffer(0, root.unwrap(memoryBuffer));
+  passEncoderRender.setVertexBuffer(1, root.unwrap(squareBuffer));
+  passEncoderRender.setBindGroup(0, root.unwrap(uniformBindGroup));
+
+  passEncoderRender.draw(4, length);
+  passEncoderRender.end();
+  device.queue.submit([commandEncoder.finish()]);
+};
+
+window.onload = startupTGPU;
