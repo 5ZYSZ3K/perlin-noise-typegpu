@@ -1,45 +1,132 @@
 "use strict";
 import tgpu from "typegpu";
 import * as d from "typegpu/data";
-import computeShaderString from "./shaders/compute.wgsl";
-import renderShaderString from "./shaders/render.wgsl";
 
-type Position = [number, number];
+let genSizes = [1024, 1024];
+const GRID_SIZE = 32;
+
+const computeShaderString = `override blockSize = 16;
+  
+fn getCell(x: u32, y: u32) -> f32 {
+  let h = size.y;
+  let w = size.x;
+  return memory[(y % h) * w + (x % w)];
+}
+
+fn getGradientsGridIndexes(position: vec3u, xShift: u32, yShift: u32) -> vec2u {
+  return vec2u((position.x / gradientsCellSize.x) + xShift, (position.y / gradientsCellSize.y) + yShift);
+}
+
+fn smootherstep(x: f32) -> f32 {
+  return  6 * pow(x, 5) - 15 * pow(x, 4) + 10 * pow(x, 3);
+}
+fn interpolate(x: f32, a: f32, b: f32) -> f32 {
+  return a + smootherstep(x) * (b - a);
+}
+
+fn dotProdGrid(position: vec3u, gradientsGridPosition: vec2u) -> f32 {
+  let positionInAGridCell: vec2f = vec2f(
+    f32(position.x) / f32(gradientsCellSize.x) - f32(gradientsGridPosition.x),
+    f32(position.y) / f32(gradientsCellSize.y) - f32(gradientsGridPosition.y),
+  );
+  let gridVector: vec2f = gradients[gradientsGridPosition.x + gradientsGridPosition.y * (gradientsGridSize.x + 1)];
+  return (
+    positionInAGridCell.x * gridVector.x +
+    positionInAGridCell.y * gridVector.y
+  );
+}
+
+fn calculateValuePerPosition(position: vec3u, index: u32) -> f32 {
+  let gradientsGridPosition: vec2u = getGradientsGridIndexes(position, 0, 0);
+  let positionInAGridCell: vec2f = vec2f(
+    f32(position.x) / f32(gradientsCellSize.x) - f32(gradientsGridPosition.x), 
+    f32(position.y) / f32(gradientsCellSize.y) - f32(gradientsGridPosition.y)
+  );
+  let topLeft: f32 = dotProdGrid(position, gradientsGridPosition);
+  let topRight: f32 = dotProdGrid(position, getGradientsGridIndexes(position, 1, 0));
+  let bottomLeft: f32 = dotProdGrid(position, getGradientsGridIndexes(position, 0, 1));
+  let bottomRight: f32 = dotProdGrid(position, getGradientsGridIndexes(position, 1, 1));
+  let topValueToInterpolate: f32 = interpolate(positionInAGridCell.x, topLeft, topRight);
+  let bottomValueToInterpolate: f32 = interpolate(positionInAGridCell.x, bottomLeft, bottomRight);
+  let interpolatedValue: f32 = interpolate(positionInAGridCell.y, topValueToInterpolate, bottomValueToInterpolate);
+  return interpolatedValue;
+}
+
+@compute @workgroup_size(blockSize, blockSize)
+fn main(@builtin(global_invocation_id) grid: vec3u) {
+  let index: u32 = grid.x + grid.y * size.x;
+  let val: f32 = calculateValuePerPosition(grid, index);
+  memory[index] = val;
+}
+`;
+
+const renderShaderString = `struct Out {
+    @builtin(position) pos: vec4f,
+    @location(0) cell: f32,
+    @location(1) uv: vec2f,
+}
+  
+@vertex
+fn vert(@builtin(instance_index) i: u32, @location(0) cell: f32, @location(1) pos: vec2u) -> Out {
+    let w = size.x;
+    let h = size.y;
+    let x = (f32(i % w + pos.x) / f32(w) - 0.5) * 2. * f32(w) / f32(max(w, h));
+    let y = (f32((i - (i % w)) / w + pos.y) / f32(h) - 0.5) * 2. * f32(h) / f32(max(w, h));
+  
+    return Out(vec4f(x, y, 0., 1.), cell, vec2f(x,y));
+}
+  
+@fragment
+fn frag(@location(0) cell: f32, @builtin(position) pos: vec4f) -> @location(0) vec4f {  
+    return vec4f((cell + 1.)/2., 0, 1. - (cell + 1.)/2., 1);
+}`;
+
+type Vector2 = { x: number; y: number };
 
 class PerlinNoise {
-  gradients: Array<Position>;
+  gradients: Array<Vector2>;
   memory: Array<number>;
-  gridSize: number;
-  resolution: number;
+  resolution: Vector2;
+  gradientsGridSize: Vector2;
+  gradientsCellSize: Vector2;
 
-  constructor(gridSize: number, resolution: number) {
-    this.gridSize = gridSize;
-    this.resolution = resolution;
-    this.gradients = [];
+  constructor(
+    gridSize: number,
+    resolution: number,
+    gradients: Array<Vector2> = []
+  ) {
+    this.resolution = { x: resolution, y: resolution };
+    this.gradientsGridSize = { x: gridSize, y: gridSize };
+    this.gradientsCellSize = {
+      x: resolution / gridSize,
+      y: resolution / gridSize,
+    };
+    this.gradients = gradients;
     this.memory = [];
   }
-  randonAngledVector(): Position {
+  randonAngledVector(): Vector2 {
     const theta = Math.random() * 2 * Math.PI;
-    return [Math.cos(theta), Math.sin(theta)];
+    return { x: Math.cos(theta), y: Math.sin(theta) };
   }
-  dotProdGrid(position: Position, gridPosition: Position) {
-    let gridIndexes: Position;
-    let positionInAGridCell = [
-      position[0] - gridPosition[0],
-      position[1] - gridPosition[1],
-    ];
+  dotProdGrid(position: Vector2, gradientsGridPosition: Vector2) {
+    let positionInAGridCell = {
+      x: position.x / this.gradientsCellSize.x - gradientsGridPosition.x,
+      y: position.y / this.gradientsCellSize.y - gradientsGridPosition.y,
+    };
+    let gridVector: Vector2;
     const gradientsIndex = Math.round(
-      gridPosition[0] + gridPosition[1] * this.gridSize
+      gradientsGridPosition.x +
+        gradientsGridPosition.y * (this.gradientsGridSize.x + 1)
     );
     if (this.gradients[gradientsIndex]) {
-      gridIndexes = this.gradients[gradientsIndex];
+      gridVector = this.gradients[gradientsIndex];
     } else {
-      gridIndexes = this.randonAngledVector();
-      this.gradients[gradientsIndex] = gridIndexes;
+      gridVector = this.randonAngledVector();
+      this.gradients[gradientsIndex] = gridVector;
     }
     return (
-      positionInAGridCell[0] * gridIndexes[0] +
-      positionInAGridCell[1] * gridIndexes[1]
+      positionInAGridCell.x * gridVector.x +
+      positionInAGridCell.y * gridVector.y
     );
   }
   smootherstep(x: number) {
@@ -48,71 +135,76 @@ class PerlinNoise {
   interpolate(x: number, a: number, b: number) {
     return a + this.smootherstep(x) * (b - a);
   }
-  get(positionOnGrid: Position) {
-    const multiplier = this.resolution / this.gridSize;
-    const memoryIndex = Math.round(
-      (positionOnGrid[0] + positionOnGrid[1] * this.resolution) * multiplier
-    );
-    if (this.memory[memoryIndex]) return this.memory[memoryIndex];
-    const gridCellIndexes: Position = [
-      Math.floor(positionOnGrid[0]),
-      Math.floor(positionOnGrid[1]),
-    ];
-    //interpolate
-    const interpolatedValues = {
-      topLeft: this.dotProdGrid(positionOnGrid, gridCellIndexes),
-      topRight: this.dotProdGrid(positionOnGrid, [
-        gridCellIndexes[0] + 1,
-        gridCellIndexes[1],
-      ]), // positionOnGrid, gridCellIndexes
-      bottomLeft: this.dotProdGrid(positionOnGrid, [
-        gridCellIndexes[0],
-        gridCellIndexes[1] + 1,
-      ]), // positionOnGrid, gridCellIndexes
-      bottomRight: this.dotProdGrid(positionOnGrid, [
-        gridCellIndexes[0] + 1,
-        gridCellIndexes[1] + 1,
-      ]),
+  getGradientsGridIndexes(
+    position: Vector2,
+    xShift: number,
+    yShift: number
+  ): Vector2 {
+    return {
+      x: Math.floor(position.x / this.gradientsCellSize.x) + xShift,
+      y: Math.floor(position.y / this.gradientsCellSize.y) + yShift,
     };
+  }
+  calculateValuePerPosition(position: Vector2) {
+    const memoryIndex = Math.round(position.x + position.y * this.resolution.x);
+    if (this.memory[memoryIndex]) return this.memory[memoryIndex];
+    let gradientsGridPosition = this.getGradientsGridIndexes(position, 0, 0);
+    let positionInAGridCell = {
+      x: position.x / this.gradientsCellSize.x - gradientsGridPosition.x,
+      y: position.y / this.gradientsCellSize.y - gradientsGridPosition.y,
+    };
+    //interpolate
+    const topLeft = this.dotProdGrid(position, gradientsGridPosition);
+    const topRight = this.dotProdGrid(
+      position,
+      this.getGradientsGridIndexes(position, 1, 0)
+    ); // positionOnGrid, gridCellIndexes
+    const bottomLeft = this.dotProdGrid(
+      position,
+      this.getGradientsGridIndexes(position, 0, 1)
+    ); // positionOnGrid, gridCellIndexes
+    const bottomRight = this.dotProdGrid(
+      position,
+      this.getGradientsGridIndexes(position, 1, 1)
+    );
     const topValueToInterpolate = this.interpolate(
-      positionOnGrid[0] - gridCellIndexes[0],
-      interpolatedValues.topLeft,
-      interpolatedValues.topRight
+      positionInAGridCell.x,
+      topLeft,
+      topRight
     );
     const bottomValueToInterpolate = this.interpolate(
-      positionOnGrid[0] - gridCellIndexes[0],
-      interpolatedValues.bottomLeft,
-      interpolatedValues.bottomRight
+      positionInAGridCell.x,
+      bottomLeft,
+      bottomRight
     );
     const interpolatedValue = this.interpolate(
-      positionOnGrid[1] - gridCellIndexes[1],
+      positionInAGridCell.y,
       topValueToInterpolate,
       bottomValueToInterpolate
     );
     this.memory[memoryIndex] = interpolatedValue;
     return interpolatedValue;
   }
+  get(position: Vector2) {
+    return this.calculateValuePerPosition(position);
+  }
 }
 
 const startup = async () => {
-  const canvas = document.querySelector("canvas") as HTMLCanvasElement;
+  const canvas = document.querySelector("#canvas2") as HTMLCanvasElement;
   let ctx = canvas.getContext("2d");
+  const RESOLUTION = genSizes[0];
+  const COLOR_SCALE = 255;
 
-  const GRID_SIZE = 4;
-  const RESOLUTION = 512;
-  const COLOR_SCALE = 250;
   const perlin = new PerlinNoise(GRID_SIZE, RESOLUTION);
-
   const pixelSize = canvas.width / RESOLUTION;
 
   for (let y = 0; y < RESOLUTION; y += 1) {
     for (let x = 0; x < RESOLUTION; x += 1) {
-      ctx.fillStyle = `hsl(${
-        perlin.get([
-          (x * GRID_SIZE) / RESOLUTION,
-          (y * GRID_SIZE) / RESOLUTION,
-        ]) * COLOR_SCALE
-      },50%,50%)`;
+      const perlin2 = perlin.get({ x, y });
+      ctx.fillStyle = `rgb(${Math.round(((perlin2 + 1) / 2) * COLOR_SCALE)},0,${
+        COLOR_SCALE - Math.round(((perlin2 + 1) / 2) * COLOR_SCALE)
+      })`;
       ctx.fillRect(x * pixelSize, y * pixelSize, pixelSize, pixelSize);
     }
   }
@@ -133,10 +225,8 @@ const startupTGPU = async () => {
   });
 
   let workgroupSize = 16;
-  let genSizes = [8192, 8192];
-  const gradientsGridSizes = [64, 64];
 
-  const computeLayout = {
+  const bindGroupLayoutCompute = tgpu.bindGroupLayout({
     memory: {
       storage: (arrayLength: number) => d.arrayOf(d.f32, arrayLength),
       access: "mutable",
@@ -153,20 +243,16 @@ const startupTGPU = async () => {
       storage: d.vec2u,
       access: "readonly",
     },
-    gridSize: {
+    gradientsCellSize: {
       storage: d.vec2u,
       access: "readonly",
     },
-  } as const;
-
-  const groupLayout = {
+  });
+  const bindGroupLayoutRender = tgpu.bindGroupLayout({
     size: {
       uniform: d.vec2u,
     },
-  } as const;
-
-  const bindGroupLayoutCompute = tgpu.bindGroupLayout(computeLayout);
-  const bindGroupLayoutRender = tgpu.bindGroupLayout(groupLayout);
+  });
 
   const computeShader = device.createShaderModule({
     code: tgpu.resolve({
@@ -209,13 +295,16 @@ const startupTGPU = async () => {
   );
 
   const memoryLength = genSizes[0] * genSizes[1];
-  console.log(memoryLength);
   const memory = Array.from({ length: memoryLength }).fill(0) as Array<number>;
+  const gradientsGridSizes = [GRID_SIZE + 1, GRID_SIZE + 1];
 
   const gradientsLength = gradientsGridSizes[0] * gradientsGridSizes[1];
   const gradients = Array.from({ length: gradientsLength })
     .fill(0)
-    .map(() => d.vec2f(Math.random(), Math.random()));
+    .map(() => {
+      const theta = Math.random() * 2 * Math.PI;
+      return d.vec2f(Math.cos(theta), Math.sin(theta));
+    });
 
   const memoryBuffer = root
     .createBuffer(d.arrayOf(d.f32, memoryLength), memory)
@@ -236,7 +325,7 @@ const startupTGPU = async () => {
   const gradientsGridSizeBuffer = root
     .createBuffer(
       d.vec2u,
-      d.vec2u(gradientsGridSizes[0], gradientsGridSizes[1])
+      d.vec2u(gradientsGridSizes[0] - 1, gradientsGridSizes[1] - 1)
     )
     .$usage("uniform", "storage");
 
@@ -244,8 +333,8 @@ const startupTGPU = async () => {
     .createBuffer(
       d.vec2u,
       d.vec2u(
-        Math.round(genSizes[0] / gradientsGridSizes[0]),
-        Math.round(genSizes[1] / gradientsGridSizes[1])
+        Math.round(genSizes[0] / (gradientsGridSizes[0] - 1)),
+        Math.round(genSizes[1] / (gradientsGridSizes[1] - 1))
       )
     )
     .$usage("uniform", "storage");
@@ -255,7 +344,7 @@ const startupTGPU = async () => {
     memory: memoryBuffer,
     gradients: gradientsBuffer,
     gradientsGridSize: gradientsGridSizeBuffer,
-    gridSize: gradientsCellSizeBuffer,
+    gradientsCellSize: gradientsCellSizeBuffer,
   });
 
   const uniformBindGroup = root.createBindGroup(bindGroupLayoutRender, {
@@ -316,9 +405,16 @@ const startupTGPU = async () => {
   passEncoderRender.setVertexBuffer(1, root.unwrap(squareBuffer));
   passEncoderRender.setBindGroup(0, root.unwrap(uniformBindGroup));
 
-  passEncoderRender.draw(4, length);
+  passEncoderRender.draw(4, memoryLength);
   passEncoderRender.end();
   device.queue.submit([commandEncoder.finish()]);
 };
 
-window.onload = startupTGPU;
+window.onload = async () => {
+  const time1 = Date.now();
+  await startupTGPU();
+  const time2 = Date.now();
+  startup();
+  const time3 = Date.now();
+  console.log("GPU time:", time2 - time1, "JS time:", time3 - time2);
+};

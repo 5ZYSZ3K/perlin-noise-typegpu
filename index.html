@@ -10,21 +10,21 @@
       }
       html, body {
         margin: 0;      /* remove default margin */
-        height: 100%;   /* make body fill the browser window */
         display: flex;
         place-content: center center;
+        flex-direction: column;
+        gap: 10px;
       }
       canvas {
-        width: 100vw;
-        height: 100vh;
-        max-width: 100vh;
-        max-height: 100vw;
+        width: 1000px;
+        height: 1000px;
         display: block;
       }
     </style>
   </head>
   <body>
-    <canvas></canvas>
+    <canvas width="4096" height="4096"></canvas>
+    <canvas width="4096" height="4096" id="canvas2"></canvas>
     <script defer src="/src/perlin-noise.ts" type="module"></script>
   </body>
 </html>
