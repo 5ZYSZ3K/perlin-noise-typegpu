@@ -2,8 +2,8 @@
 import tgpu from "typegpu";
 import * as d from "typegpu/data";
 
-let genSizes = [1024, 1024];
-const GRID_SIZE = 32;
+let genSizes = [2048, 2048];
+const GRID_SIZE = 16;
 
 const computeShaderString = `override blockSize = 16;
   
